@@ -47,36 +47,59 @@ class OnnxModel(DocLayoutModel):
         metadata = {d.key: d.value for d in model.metadata_props}
         self._stride = ast.literal_eval(metadata["stride"])
         self._names = ast.literal_eval(metadata["names"])
-        providers = []
 
-        available_providers = onnxruntime.get_available_providers()
-        use_coreml = os_name == "Darwin" and any(
-            re.match(r"coreml", p, re.IGNORECASE) for p in available_providers
-        )
-        if use_coreml:
-            # Fix input shapes to [1, 3, 1024, 1024] so CoreML can take over
-            # 96%+ of the graph nodes (658/681) instead of just 3/823.
+        available = set(p.lower() for p in onnxruntime.get_available_providers())
+        providers: list[str] = []
+
+        # ---- priority chain: NVIDIA → Intel iGPU → CPU -------------------
+        if os_name == "Darwin" and "coreml" in (
+            p.lower() for p in onnxruntime.get_available_providers()
+        ):
             model = self._make_static_model(model, self._FIXED_IMGSZ)
-            providers = [
-                "CoreMLExecutionProvider",
-                "CPUExecutionProvider",
-            ]
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
             logger.info(
                 "Using CoreMLExecutionProvider with static input "
                 f"[1, 3, {self._FIXED_IMGSZ}, {self._FIXED_IMGSZ}]"
             )
         else:
-            for provider in available_providers:
-                # disable dml|cuda|
-                # directml/cuda may encounter problems under special circumstances
-                if re.match(r"cpu", provider, re.IGNORECASE):
-                    logger.info(f"Available Provider: {provider}")
-                    providers.append(provider)
+            # 1. NVIDIA GPU (CUDA / TensorRT)
+            for p in ("CUDAExecutionProvider", "TensorrtExecutionProvider"):
+                if p.lower() in available:
+                    providers.append(p)
+                    logger.info("Using %s", p)
+                    break
+            # 2. Intel integrated GPU (OpenVINO)
+            if not providers and "openvinoexecutionprovider" in available:
+                providers.append("OpenVINOExecutionProvider")
+                logger.info("Using OpenVINOExecutionProvider (Intel iGPU)")
+            # 3. CPU — always available
+            if not providers:
+                providers.append("CPUExecutionProvider")
+                logger.info("Using CPUExecutionProvider")
+
+        import multiprocessing as _mp
+
+        _sess_opts = onnxruntime.SessionOptions()
+        _sess_opts.inter_op_num_threads = max(1, _mp.cpu_count() // 2)
+        _sess_opts.intra_op_num_threads = max(4, _mp.cpu_count())
+        _sess_opts.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         self.model = onnxruntime.InferenceSession(
             model.SerializeToString(),
+            sess_options=_sess_opts,
             providers=providers,
+            # Providers that fail at runtime are skipped automatically.
+            # e.g. CUDA driver not found → falls to OpenVINO → falls to CPU.
         )
         self.lock = threading.Lock()
+        logger.info(
+            "ONNX session created — active provider chain: %s — "
+            "inter_threads=%d, intra_threads=%d",
+            [p.replace("ExecutionProvider", "") for p in providers],
+            _sess_opts.inter_op_num_threads,
+            _sess_opts.intra_op_num_threads,
+        )
 
     @staticmethod
     def _make_static_model(model, imgsz):

@@ -838,6 +838,8 @@ def _do_translate_single(
     translation_config: TranslationConfig,
 ) -> TranslateResult:
     """Original translation logic for a single document or part"""
+    import pickle as _pickle
+
     translation_config.progress_monitor = pm
 
     if translation_config.shared_context_cross_split_part.auto_enabled_ocr_workaround:
@@ -896,6 +898,38 @@ def _do_translate_single(
     #             "Fast scanned check hit, Please check the input PDF file.",
     #         )
     #         raise ScannedPDFError("Scanned PDF detected.")
+
+    # ---- checkpoint: skip parsing stages if a cached IL exists ----------
+    # In-memory cache (survives model-switch resume, as long as the server
+    # process stays alive).  Falls back to a disk pickle for restart resumption.
+    _cached = getattr(translation_config, "cached_il", None)
+    if _cached is not None:
+        docs = _cached
+        logger.info("Reusing in-memory IL — skipping parsing stages")
+    else:
+        _il_pickle = (Path(translation_config.output_dir)
+                      / f"{Path(translation_config.input_file).stem}.il.pickle")
+        if _il_pickle.exists():
+            logger.info("Loading IL from %s", _il_pickle)
+            with _il_pickle.open("rb") as _f:
+                docs = _pickle.load(_f)
+            logger.info("Loaded IL from disk — skipping parsing stages")
+        else:
+            docs = None  # will fall through to normal parsing below
+
+    if docs is not None:
+        translate_engine = translation_config.translator
+        if not translation_config.skip_translation:
+            support = translator_supports_llm(translate_engine)
+            il_translator_cls = ILTranslatorLLMOnly if support else ILTranslator
+            il_translator = il_translator_cls(translate_engine, translation_config)
+            il_translator.translate(docs)
+            del il_translator
+        Typesetting(translation_config).typesetting_document(docs)
+        pdf_creater = PDFCreater(temp_pdf_path, docs, translation_config, mediabox_data)
+        result = pdf_creater.write(translation_config)
+        result.original_pdf_path = translation_config.input_file
+        return result
 
     xml_converter = XMLConverter()
     logger.debug(f"start parse il from {temp_pdf_path}")
@@ -982,6 +1016,16 @@ def _do_translate_single(
             docs,
             translation_config.get_working_file_path("styles_and_formulas.json"),
         )
+
+    # ---- checkpoint: save IL in-memory + disk fallback -----------------
+    translation_config.cached_il = docs
+    _il_pickle = (Path(translation_config.output_dir)
+                  / f"{Path(translation_config.input_file).stem}.il.pickle")
+    try:
+        with _il_pickle.open("wb") as _f:
+            _pickle.dump(docs, _f)
+    except Exception:
+        logger.warning("Failed to save IL checkpoint to disk", exc_info=True)
 
     translate_engine = translation_config.translator
     term_extraction_engine = translation_config.get_term_extraction_translator()
