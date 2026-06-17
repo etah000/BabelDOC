@@ -13,6 +13,45 @@ from babeldoc.format.pdf.new_parser.sinks.native_text import (
 )
 
 
+def _emit_page_to_sink(
+    *,
+    events,
+    resource_bundle,
+    sink: EmitterSink,
+    base_operations,
+    text_run_positioner: object,
+    page: PreparedPdfPage,
+) -> object:
+    """Emit the already-parsed page events into *sink* (runs on the main thread)."""
+    emit_native_text_events_to_legacy_sink(
+        events,
+        resource_bundle,
+        sink,
+        xobject_end_operations=base_operations.xobject_end_operations,
+        text_run_positioner=text_run_positioner,
+    )
+    x0, y0, x1, y1 = page_base_operation_cropbox(page)
+    return wrap_page_base_operation(
+        base_operations.page_inner_operation,
+        (x0, y0, x1, y1),
+    )
+
+
+def _parse_page_heavy(
+    page: PreparedPdfPage,
+    resource_runtime: PageResourceRuntime,
+) -> tuple:
+    """Parse a single page's content stream — pure PyMuPDF C calls that
+    release the GIL, so this can run in parallel across threads."""
+    resource_bundle = resource_runtime.build_page_resource_bundle(
+        page.resource_tree,
+    )
+    events, resource_bundle, base_operations = (
+        interpret_page_with_resource_bundle(page, resource_bundle)
+    )
+    return (events, resource_bundle, base_operations)
+
+
 def create_native_page_interpreter(
     sink: EmitterSink,
     text_run_positioner: object,
@@ -36,26 +75,16 @@ def create_native_page_interpreter(
             sink.on_page_number(pageno)
 
         def process_page(self, page: PreparedPdfPage) -> object:
-            resource_bundle = resource_runtime.build_page_resource_bundle(
-                page.resource_tree,
+            events, resource_bundle, base_operations = _parse_page_heavy(
+                page, resource_runtime,
             )
-            events, resource_bundle, base_operations = (
-                interpret_page_with_resource_bundle(
-                    page,
-                    resource_bundle,
-                )
-            )
-            emit_native_text_events_to_legacy_sink(
-                events,
-                resource_bundle,
-                sink,
-                xobject_end_operations=base_operations.xobject_end_operations,
+            return _emit_page_to_sink(
+                events=events,
+                resource_bundle=resource_bundle,
+                sink=sink,
+                base_operations=base_operations,
                 text_run_positioner=text_run_positioner,
-            )
-            x0, y0, x1, y1 = page_base_operation_cropbox(page)
-            return wrap_page_base_operation(
-                base_operations.page_inner_operation,
-                (x0, y0, x1, y1),
+                page=page,
             )
 
         def end_page(self, page: PreparedPdfPage, pageno: int) -> None:

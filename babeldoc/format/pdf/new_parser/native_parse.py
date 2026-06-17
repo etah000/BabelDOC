@@ -72,6 +72,8 @@ def parse_prepared_pdf_with_new_parser_to_legacy_ir(
             config.should_translate_page,
             prepared_pages,
             page_interpreter,
+            resource_runtime,
+            NativeTextRunPositioner(),
         )
 
 

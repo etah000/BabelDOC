@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 import platform
 import re
 import threading
@@ -250,20 +251,50 @@ class OnnxModel(DocLayoutModel):
     ) -> Generator[
         tuple[babeldoc.format.pdf.document_il.il_version_1.Page, YoloResult], None, None
     ]:
-        for page in pages:
-            translate_config.raise_if_cancelled()
-            with self.lock:
-                # pix = mupdf_doc[page.page_number].get_pixmap(dpi=72)
-                pix = get_no_rotation_img(mupdf_doc[page.page_number])
-            image = np.frombuffer(pix.samples, np.uint8).reshape(
-                pix.height,
-                pix.width,
-                3,
-            )[:, :, ::-1]
-            predict_result = self.predict(image)[0]
-            save_debug_image(
-                image,
-                predict_result,
-                page.page_number + 1,
-            )
-            yield page, predict_result
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_workers = min(max(os.cpu_count() or 4, 2), 16)
+        batch_size = max(n_workers * 2, 8)  # small batches → incremental progress
+
+        offset = 0
+        while offset < len(pages):
+            batch_pages = pages[offset : offset + batch_size]
+
+            # --- step 1: extract page images (serial — PyMuPDF needs the lock) ---
+            entries: list[tuple] = []  # (page, image)
+            for page in batch_pages:
+                translate_config.raise_if_cancelled()
+                with self.lock:
+                    pix = get_no_rotation_img(mupdf_doc[page.page_number])
+                image = np.frombuffer(pix.samples, np.uint8).reshape(
+                    pix.height,
+                    pix.width,
+                    3,
+                )[:, :, ::-1]
+                entries.append((page, image))
+
+            # --- step 2: ONNX inference in parallel within the batch ---
+            batch_results: list = [None] * len(entries)
+
+            def _infer(idx: int, image):
+                return idx, self.predict(image)[0]
+
+            if len(entries) == 1:
+                _, pred = _infer(0, entries[0][1])
+                batch_results[0] = pred
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    futures = {
+                        executor.submit(_infer, idx, image): idx
+                        for idx, (_, image) in enumerate(entries)
+                    }
+                    for future in as_completed(futures):
+                        idx, pred = future.result()
+                        batch_results[idx] = pred
+
+            # --- step 3: yield this batch in original page order ---
+            for idx, (page, image) in enumerate(entries):
+                save_debug_image(image, batch_results[idx], page.page_number + 1)
+                yield page, batch_results[idx]
+
+            offset += batch_size
